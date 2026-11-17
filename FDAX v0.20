@@ -1,0 +1,397 @@
+//@version=6
+// v0.20
+// backtest 2024 - current
+// profit factor 1.7 
+// 50.82 % profit, 
+// max loss 7.78 % ,
+// ═══════════════════════════════════════════════════════════════════════════
+//  OPENING RANGE BREAKOUT — FUTURES · BACKTEST + TRADERSPOST WEBHOOK
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOGIC
+//    1. Opening range captured from a configurable clock window in
+//       Europe/Berlin exchange time.
+//    2. OR high / OR low drawn for the rest of the session, capped by a
+//       configurable maximum duration.
+//    3. Entry needs a close outside the range, with per-side confirmation-
+//       bar counts.
+//    4. Optional volume filter, and an EMA trend filter (default ON, 200
+//       period).
+//    5. ATR stop / ATR target, both configurable.
+//
+//  ALERT SETUP
+//    TradingView → Alert → Condition: this strategy
+//      • "Order fills only"
+//      • Message:  {{strategy.order.alert_message}}
+//      • Webhook URL: your TradersPost webhook
+//    Keep "Also fire alert() calls" OFF with that setting or every order
+//    sends two webhooks.
+//
+//  TIMEFRAME NOTE
+//    The opening range cannot be finer than your chart. A 5-minute OR needs
+//    a 5-minute chart; on a 1-hour chart the OR becomes the full first hour.
+// ═══════════════════════════════════════════════════════════════════════════
+
+strategy(title                   = "Opening Range Breakout — Futures",
+         shorttitle              = "ORB",
+         overlay                 = true,
+         initial_capital         = 25000,
+         currency                = currency.USD,
+         default_qty_type        = strategy.fixed,
+         default_qty_value       = 1,
+         commission_type         = strategy.commission.cash_per_contract,
+         commission_value        = 2.50,
+         slippage                = 1,
+         pyramiding              = 0,
+         margin_long             = 2,
+         margin_short            = 2,
+         calc_on_every_tick      = false,
+         process_orders_on_close = true,
+         max_labels_count        = 500)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  1 · INPUTS
+// ───────────────────────────────────────────────────────────────────────────
+grpD = "Direction"
+dirMode = input.string("Both", "Trade direction",
+     options = ["Both", "Long only", "Short only"], group = grpD)
+
+grpO = "Opening range (exchange time)"
+orSess    = input.session("0900-0935", "OR window", group = grpO,
+     tooltip = "Exchange time (Europe/Berlin). Retained for display / back-compat; integer clock inputs below drive the OR calculation.")
+orStartH  = input.int(9,  "OR start hour",   minval = 0, maxval = 23, group = grpO)
+orStartM  = input.int(0,  "OR start minute", minval = 0, maxval = 59, group = grpO)
+orEndH    = input.int(9,  "OR end hour",     minval = 0, maxval = 23, group = grpO)
+orEndM    = input.int(35, "OR end minute",   minval = 0, maxval = 59, group = grpO)
+maxOrHrs  = input.float(8.0, "Max OR display (hours)", minval = 0.25, step = 0.25, group = grpO)
+onePerSide= input.bool(true, "Only one trade per side per OR", group = grpO)
+useCompress = input.bool(false, "Compression filter (narrow pre-market)", group = grpO,
+     tooltip = "Only take breakouts when the pre-market range is below the threshold. Narrow overnight range = compressed = stronger breakout.")
+pmStartH = input.int(3,  "Pre-market start hour", minval = 0, maxval = 23, group = grpO)
+pmEndH   = input.int(9,  "Pre-market end hour",   minval = 0, maxval = 23, group = grpO)
+pmMaxPts = input.float(30.0, "Max pre-market range (index points)", minval = 0.0, step = 1.0, group = grpO,
+     tooltip = "DAX points, NOT ticks. The pre-market ER does not count full 1-hour bars, do not include the 09:00 hour itself.")
+
+grpE = "Entry"
+breakBars = input.int(1, "Long: bars closing outside OR", minval = 1, maxval = 10, group = grpE)
+shortBreakBars = input.int(2, "Short: bars closing outside OR", minval = 1, maxval = 10, group = grpE)
+
+grpV = "Volume filter"
+useVol    = input.bool(true, "Require elevated volume", group = grpV)
+volMult   = input.float(1.0, "Volume ≥ average ×", minval = 0.5, step = 0.05, group = grpV)
+volLen    = input.int(20, "Volume average length", minval = 1, group = grpV)
+volBoth   = input.bool(false, "Apply to both breakout bars", group = grpV)
+
+grpF = "Trend filters (test individually)"
+useEma  = input.bool(true,  "EMA filter", group = grpF)
+emaLen  = input.int(200, "EMA length", minval = 1, group = grpF)
+
+grpR = "Risk (ATR)"
+atrLen       = input.int(14,  "ATR length", minval = 1, group = grpR)
+atrSL        = input.float(0.5, "Stop   = ATR ×", minval = 0.05, step = 0.05, group = grpR)
+atrTP        = input.float(2.0, "Target = ATR ×", minval = 0.05, step = 0.05, group = grpR)
+minStopTicks = input.int(2, "Minimum stop distance (ticks)", minval = 0, group = grpR)
+exitOnOpp    = input.bool(true, "Exit on opposite breakout signal", group = grpR)
+
+grpS = "Session (exchange time)"
+tradeSess = input.session("0900-1730", "Trading session", group = grpS,
+     tooltip = "Exchange time (Europe/Berlin).")
+useSess   = input.bool(true, "Restrict entries to session", group = grpS)
+useFlat   = input.bool(true, "Flatten before close", group = grpS)
+flatH     = input.int(17, "Flatten hour", minval = 0, maxval = 23, group = grpS)
+flatM     = input.int(25, "Flatten minute", minval = 0, maxval = 59, group = grpS)
+
+grpW = "Webhook (TradersPost)"
+webhookOn      = input.bool(true, "Build webhook JSON", group = grpW)
+symbolOverride = input.string("", "Ticker override (blank = chart symbol)", group = grpW)
+qtyWebhook     = input.int(1, "Contracts per webhook", minval = 1, group = grpW)
+useBracket     = input.bool(true, "Include stop/target in entry payload", group = grpW,
+     tooltip = "Adds stopLoss/takeProfit objects so the broker holds a bracket. Verify field names against your TradersPost plan docs.")
+sendViaAlertFn = input.bool(false, "Also fire alert() calls", group = grpW,
+     tooltip = "Leave OFF when the alert condition is 'Order fills only'. Turning it on with 'Order fills and alert() function calls' double-sends every order.")
+
+grpX = "Display"
+showOR      = input.bool(true, "Draw opening range", group = grpX)
+showFilters = input.bool(true, "Plot EMA", group = grpX)
+showLevels  = input.bool(true, "Plot stop / target", group = grpX)
+showStats   = input.bool(true, "Stats table", group = grpX)
+debugBlocker = input.bool(false, "Debug: show blocker", group = grpX)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  2 · INDICATORS
+// ───────────────────────────────────────────────────────────────────────────
+atr     = ta.atr(atrLen)
+volAvg  = ta.sma(volume, volLen)
+emaVal  = ta.ema(close, emaLen)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  3 · OPENING RANGE ENGINE  (exchange timezone)
+// ───────────────────────────────────────────────────────────────────────────
+var float orHigh    = na
+var float orLow     = na
+var int   orStart   = na
+var bool  orReady   = false
+var bool  longDone  = false
+var bool  shortDone = false
+var float pmHigh    = na
+var float pmLow     = na
+
+bH    = hour(time, "Europe/Berlin")
+bM    = minute(time, "Europe/Berlin")
+bMin  = bH * 60 + bM
+orBeg = orStartH * 60 + orStartM
+orEnd = orEndH * 60 + orEndM
+inOR  = bMin >= orBeg and bMin < orEnd
+newOR = inOR and not inOR[1]
+newDay = ta.change(time("D")) != 0
+orSessionEnded = not inOR and inOR[1]
+
+if newDay
+    orHigh    := na
+    orLow     := na
+    orStart   := na
+    orReady   := false
+    longDone  := false
+    shortDone := false
+
+if newOR
+    orHigh    := high
+    orLow     := low
+    orStart   := time
+    orReady   := false
+    longDone  := false
+    shortDone := false
+
+if inOR and not newOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow, low)
+
+// Pre-market range tracking (overnight compression)
+inPM = bMin >= (pmStartH * 60) and bMin < (pmEndH * 60)
+newPM = inPM and not inPM[1]
+if newPM
+    pmHigh := high
+    pmLow  := low
+if inPM and not newPM
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow  := na(pmLow)  ? low  : math.min(pmLow, low)
+if newDay
+    pmHigh := na
+    pmLow  := na
+
+pmRange     = (not na(pmHigh) and not na(pmLow)) ? (pmHigh - pmLow) : na
+pmCompressed = not na(pmRange) and pmRange < pmMaxPts
+compressOK   = not useCompress or pmCompressed
+
+if orSessionEnded
+    orReady := true
+
+orValidBase = orReady and not na(orHigh) and not na(orLow) and not na(orStart)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  4 · SESSION + OR VALIDITY
+// ───────────────────────────────────────────────────────────────────────────
+inSess   = not useSess or not na(time(timeframe.period, tradeSess))
+flatTs   = timestamp(year, month, dayofmonth, flatH, flatM)
+pastFlat = useFlat and not na(flatTs) and time >= flatTs
+
+int maxOrMs = int(maxOrHrs * 60 * 60 * 1000)
+orValid  = orReady and not na(orStart) and (time - orStart) <= maxOrMs and inSess
+canTrade = inSess and not pastFlat
+
+// ───────────────────────────────────────────────────────────────────────────
+//  5 · BREAKOUT + FILTERS
+// ───────────────────────────────────────────────────────────────────────────
+bool outsideUp   = orValid and close > orHigh
+bool outsideDown = orValid and close < orLow
+
+// N consecutive closes outside the range (2 by default)
+bool barLong  = true
+bool barShort = true
+for i = 0 to math.min(breakBars - 1, bar_index)
+    barLong := barLong and outsideUp[i] == true
+for i = 0 to math.min(shortBreakBars - 1, bar_index)
+    barShort := barShort and outsideDown[i] == true
+
+// Volume: current bar vs its own moving average, optionally both bars
+volHot   = volume >= volAvg * volMult
+volPass  = not useVol or (volBoth ? (volHot and volHot[1]) : volHot)
+
+// Directional trend filters
+emaLong   = not useEma  or close > emaVal
+emaShort  = not useEma  or close < emaVal
+
+allowLong  = dirMode != "Short only"
+allowShort = dirMode != "Long only"
+
+longOK  = barLong  and volPass and emaLong  and compressOK
+shortOK = barShort and volPass and emaShort and compressOK
+
+longSignal  = longOK  and allowLong  and canTrade and (not onePerSide or not longDone)
+shortSignal = shortOK and allowShort and canTrade and (not onePerSide or not shortDone)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  6 · RISK ENGINE
+// ───────────────────────────────────────────────────────────────────────────
+minDist = minStopTicks * syminfo.mintick
+
+// Provisional signal-bar levels; once filled, exits are anchored to the actual fill price.
+longSL  = close - math.max(atr * atrSL, minDist)
+longTP  = close + math.max(atr * atrTP, minDist)
+shortSL = close + math.max(atr * atrSL, minDist)
+shortTP = close - math.max(atr * atrTP, minDist)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  7 · WEBHOOK ENGINE
+// ───────────────────────────────────────────────────────────────────────────
+f_payload(string sym, string action, string sentiment, float stopPx, float tpPx, bool bracket) =>
+    string s = '{"ticker":"' + sym + '"'
+    s := s + ',"action":"' + action + '"'
+    s := s + ',"sentiment":"' + sentiment + '"'
+    s := s + ',"quantity":' + str.tostring(qtyWebhook)
+    s := s + ',"orderType":"market"'
+    if bracket and not na(stopPx) and not na(tpPx)
+        s := s + ',"stopLoss":{"stopPrice":' + str.tostring(stopPx, format.mintick) + '}'
+        s := s + ',"takeProfit":{"limitPrice":' + str.tostring(tpPx, format.mintick) + '}'
+    s := s + '}'
+    s
+
+sym = str.length(symbolOverride) > 0 ? symbolOverride : syminfo.ticker
+
+longEntryMsg  = webhookOn ? f_payload(sym, "buy",  "long",  longSL,  longTP,  useBracket) : ""
+shortEntryMsg = webhookOn ? f_payload(sym, "sell", "short", shortSL, shortTP, useBracket) : ""
+exitLongMsg   = webhookOn ? f_payload(sym, "sell", "long",  na, na, false) : ""
+exitShortMsg  = webhookOn ? f_payload(sym, "buy",  "short", na, na, false) : ""
+
+// ───────────────────────────────────────────────────────────────────────────
+//  8 · ORDER MANAGEMENT
+// ───────────────────────────────────────────────────────────────────────────
+var float slLevel = na
+var float tpLevel = na
+
+if strategy.position_size == 0 and not longSignal and not shortSignal
+    slLevel := na
+    tpLevel := na
+
+// Exit on opposite raw breakout when we are not flipping.
+if exitOnOpp and strategy.position_size > 0 and outsideDown
+    strategy.close("Long", comment = "Opp signal", alert_message = exitLongMsg)
+if exitOnOpp and strategy.position_size < 0 and outsideUp
+    strategy.close("Short", comment = "Opp signal", alert_message = exitShortMsg)
+
+// Long side
+if longSignal and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment = "Flip long", alert_message = exitShortMsg)
+    strategy.entry("Long", strategy.long, alert_message = longEntryMsg)
+    slLevel  := longSL
+    tpLevel  := longTP
+    longDone := true
+    if sendViaAlertFn
+        alert(longEntryMsg, alert.freq_once_per_bar_close)
+
+// Short side
+if shortSignal and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment = "Flip short", alert_message = exitLongMsg)
+    strategy.entry("Short", strategy.short, alert_message = shortEntryMsg)
+    slLevel   := shortSL
+    tpLevel   := shortTP
+    shortDone := true
+    if sendViaAlertFn
+        alert(shortEntryMsg, alert.freq_once_per_bar_close)
+
+// Once a position exists, refresh the bracket from the actual fill price.
+if strategy.position_size > 0
+    fillPrice = strategy.position_avg_price
+    stopPx = fillPrice - math.max(atr * atrSL, minDist)
+    limitPx = fillPrice + math.max(atr * atrTP, minDist)
+    strategy.exit("Long-X", from_entry = "Long", stop = stopPx, limit = limitPx, alert_message = exitLongMsg)
+    slLevel := stopPx
+    tpLevel := limitPx
+
+if strategy.position_size < 0
+    fillPrice = strategy.position_avg_price
+    stopPx = fillPrice + math.max(atr * atrSL, minDist)
+    limitPx = fillPrice - math.max(atr * atrTP, minDist)
+    strategy.exit("Short-X", from_entry = "Short", stop = stopPx, limit = limitPx, alert_message = exitShortMsg)
+    slLevel := stopPx
+    tpLevel := limitPx
+
+// Flatten-before-close
+flatMsg = webhookOn ? f_payload(sym,
+     strategy.position_size > 0 ? "sell" : "buy",
+     strategy.position_size > 0 ? "long" : "short", na, na, false) : ""
+
+if pastFlat and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat", alert_message = flatMsg)
+    if sendViaAlertFn
+        alert(flatMsg, alert.freq_once_per_bar_close)
+
+// ───────────────────────────────────────────────────────────────────────────
+//  9 · PLOTS
+// ───────────────────────────────────────────────────────────────────────────
+pOrH = plot(showOR and orValid ? orHigh : na, "OR High",
+     color.new(color.aqua, 0), 1, plot.style_linebr)
+pOrL = plot(showOR and orValid ? orLow : na, "OR Low",
+     color.new(color.aqua, 0), 1, plot.style_linebr)
+fill(pOrH, pOrL, color.new(color.aqua, 92), title = "OR band")
+
+plot(showFilters and useEma  ? emaVal  : na, "EMA",  color.new(color.orange,  0), 1)
+
+plot(showLevels ? slLevel : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)
+plot(showLevels ? tpLevel : na, "Target", color.new(color.green, 0), 1, plot.style_linebr)
+
+plotshape(longSignal,  "Long entry",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(shortSignal, "Short entry", shape.triangledown, location.abovebar, color.new(color.red,   0), size = size.tiny)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 10 · DEBUG TABLE
+// ───────────────────────────────────────────────────────────────────────────
+var table dbg = table.new(position.bottom_right, 2, 8,
+     border_width = 1, border_color = color.new(color.gray, 60),
+     frame_width  = 1, frame_color  = color.new(color.gray, 60))
+
+if debugBlocker and barstate.islast
+    table.cell(dbg, 0, 0, "ENTRY GATE", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 1, 0, "PASS?", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 0, 1, "orValid", text_size = size.small)
+    table.cell(dbg, 1, 1, str.tostring(orValid), text_size = size.small)
+    table.cell(dbg, 0, 2, "barLong", text_size = size.small)
+    table.cell(dbg, 1, 2, str.tostring(barLong), text_size = size.small)
+    table.cell(dbg, 0, 3, "volPass", text_size = size.small)
+    table.cell(dbg, 1, 3, str.tostring(volPass), text_size = size.small)
+    table.cell(dbg, 0, 4, "canTrade", text_size = size.small)
+    table.cell(dbg, 1, 4, str.tostring(canTrade), text_size = size.small)
+    table.cell(dbg, 0, 5, "long/short OK", text_size = size.small)
+    table.cell(dbg, 1, 5, str.tostring(longOK) + " / " + str.tostring(shortOK), text_size = size.small)
+    table.cell(dbg, 0, 6, "preMkt range", text_size = size.small)
+    table.cell(dbg, 1, 6, na(pmRange) ? "—" : str.tostring(pmRange, "#.#"), text_size = size.small)
+    table.cell(dbg, 0, 7, "compressOK", text_size = size.small)
+    table.cell(dbg, 1, 7, str.tostring(compressOK), text_size = size.small)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 11 · BACKTEST STATS
+// ───────────────────────────────────────────────────────────────────────────
+var table st = table.new(position.top_right, 2, 6,
+     border_width = 1, border_color = color.new(color.gray, 60),
+     frame_width  = 1, frame_color  = color.new(color.gray, 60))
+
+if showStats and barstate.islast
+    int   trades = strategy.closedtrades
+    float gp     = strategy.grossprofit
+    float gl     = math.abs(strategy.grossloss)
+    float pf     = gl > 0 ? gp / gl : na
+    float winPct = trades > 0 ? 100.0 * strategy.wintrades / trades : na
+
+    table.cell(st, 0, 0, "METRIC", text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(st, 1, 0, "VALUE",  text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(st, 0, 1, "Net P&L", text_size = size.small)
+    table.cell(st, 1, 1, str.tostring(strategy.netprofit, "#,###.##"), text_size = size.small)
+    table.cell(st, 0, 2, "Max DD %", text_size = size.small)
+    table.cell(st, 1, 2, str.tostring(strategy.max_drawdown_percent, "#.##") + "%", text_size = size.small)
+    table.cell(st, 0, 3, "Closed trades", text_size = size.small)
+    table.cell(st, 1, 3, str.tostring(trades), text_size = size.small)
+    table.cell(st, 0, 4, "Win rate", text_size = size.small)
+    table.cell(st, 1, 4, na(winPct) ? "—" : str.tostring(winPct, "#.#") + "%", text_size = size.small)
+    table.cell(st, 0, 5, "Profit factor", text_size = size.small)
+    table.cell(st, 1, 5, na(pf) ? "—" : str.tostring(pf, "#.##"), text_size = size.small)
