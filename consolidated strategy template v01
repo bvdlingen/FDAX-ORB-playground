@@ -1,0 +1,327 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONSOLIDATED STRATEGY + OPENING RANGE · v2
+//   1 · Tester         date range, direction, entry session
+//   2 · Entry engine   EMA+RSI / Donchian / RSI reversal / OR breakout / combo
+//   3 · Filters        trend EMA, RSI band, minimum volatility
+//   4 · Stops          fixed at entry, ATR trailing, breakeven, time stop
+//   5 · Sizing         equity % / fixed contracts / risk % per trade
+//   6 · Opening range  session-based, timezone aware, lines kept until cutoff
+//   7 · Visuals
+// ═══════════════════════════════════════════════════════════════════════════════
+
+strategy("Configurable Strategy + Opening Range",
+     shorttitle              = "CFG+OR",
+     overlay                 = true,
+     initial_capital         = 10000,
+     currency                = currency.USD,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 10,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.04,
+     slippage                = 1,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false)
+
+// ─────────────────────────────── 1 · TESTER ────────────────────────────────────
+gT = "1 · Tester & data"
+i_start   = input.time(1577836800000, "Backtest start", group = gT)   // 2020-01-01 UTC
+i_end     = input.time(4102444800000, "Backtest end",   group = gT)   // 2100-01-01 UTC
+i_dir     = input.string("Long & Short", "Trade direction", options = ["Long & Short", "Long only", "Short only"], group = gT)
+i_useSess = input.bool(false, "Restrict entries to session", group = gT)
+i_sess    = input.session("0900-1730", "Entry session", group = gT)
+
+// ──────────────────────────── 2 · ENTRY ENGINE ────────────────────────────────
+gE = "2 · Entry engine"
+i_engine = input.string("EMA + RSI", "Entry logic", options = ["EMA + RSI", "Donchian breakout", "RSI reversal", "OR breakout only", "EMA + RSI or OR breakout"], group = gE)
+i_fast   = input.int(20, "Fast EMA", minval = 1, group = gE)
+i_slow   = input.int(50, "Slow EMA", minval = 2, group = gE)
+i_dcLen  = input.int(20, "Donchian length", minval = 2, group = gE)
+i_rsiLen = input.int(14, "RSI length", minval = 2, group = gE)
+i_rsiUse = input.bool(true, "Use RSI band filter", group = gE)
+i_rsiLMin = input.int(50, "Long: RSI min", minval = 0, maxval = 100, group = gE)
+i_rsiLMax = input.int(70, "Long: RSI max", minval = 0, maxval = 100, group = gE)
+i_rsiSMin = input.int(30, "Short: RSI min", minval = 0, maxval = 100, group = gE)
+i_rsiSMax = input.int(50, "Short: RSI max", minval = 0, maxval = 100, group = gE)
+i_rsiOS  = input.int(30, "Reversal: oversold", minval = 1, maxval = 49, group = gE)
+i_rsiOB  = input.int(70, "Reversal: overbought", minval = 51, maxval = 99, group = gE)
+
+// ─────────────────────────────── 3 · FILTERS ──────────────────────────────────
+gF = "3 · Filters"
+i_useTrend  = input.bool(true, "Trend filter (close vs EMA)", group = gF)
+i_trendLen  = input.int(200, "Trend EMA length", minval = 1, group = gF)
+i_useVol    = input.bool(false, "Minimum volatility", group = gF)
+i_volLen    = input.int(14, "ATR length (filter)", minval = 1, group = gF)
+i_minAtrPct = input.float(0.25, "Min ATR as % of price", minval = 0.0, step = 0.05, group = gF)
+
+// ───────────────────────────── 4 · STOPS & TARGETS ────────────────────────────
+gR = "4 · Stops & targets"
+i_slMode   = input.string("ATR", "Stop-loss", options = ["ATR", "Percent", "None"], group = gR)
+i_atrLen   = input.int(14, "ATR length", minval = 1, group = gR)
+i_slAtrMult = input.float(2.0, "Stop = ATR ×", minval = 0.1, step = 0.1, group = gR)
+i_slPct    = input.float(1.5, "Stop = % of price", minval = 0.01, step = 0.1, group = gR)
+i_tpMode   = input.string("R:R", "Take-profit", options = ["R:R", "ATR", "Percent", "None"], group = gR)
+i_rrMult   = input.float(2.0, "Target = R ×", minval = 0.1, step = 0.1, group = gR, tooltip = "Multiple of the stop distance; falls back to 'Percent' when no stop is used.")
+i_tpAtrMult = input.float(3.0, "Target = ATR ×", minval = 0.1, step = 0.1, group = gR)
+i_tpPct    = input.float(3.0, "Target = % of price", minval = 0.01, step = 0.1, group = gR)
+i_useTrail = input.bool(false, "ATR trailing stop", group = gR)
+i_trailMult = input.float(3.0, "Trail = ATR ×", minval = 0.1, step = 0.1, group = gR)
+i_useBE    = input.bool(false, "Move stop to breakeven", group = gR)
+i_beTrigger = input.float(1.0, "Breakeven trigger (R)", minval = 0.1, step = 0.1, group = gR)
+i_beOffset = input.float(0.0, "Breakeven offset (% of price)", minval = 0.0, step = 0.01, group = gR)
+i_maxBars  = input.int(0, "Max bars in trade (0 = off)", minval = 0, group = gR)
+i_exitOnOpp = input.bool(true, "Exit on opposite signal", group = gR)
+
+// ─────────────────────────── 5 · POSITION SIZING ──────────────────────────────
+gS = "5 · Position sizing"
+i_sizeMode  = input.string("Percent of equity", "Sizing mode", options = ["Percent of equity", "Fixed contracts", "Risk % per trade"], group = gS, tooltip = "'Risk %' needs an active stop; falls back to fixed contracts otherwise.")
+i_equityPct = input.float(10.0, "Equity per trade (%)", minval = 0.1, step = 0.5, group = gS)
+i_fixedQty  = input.float(1.0, "Fixed contracts", minval = 0.0001, step = 1.0, group = gS)
+i_riskPct   = input.float(1.0, "Risk per trade (%)", minval = 0.01, step = 0.1, group = gS)
+
+// ─────────────────────────── 6 · OPENING RANGE ────────────────────────────────
+gO = "6 · Opening range"
+i_showOR   = input.bool(true, "Draw opening range", group = gO)
+i_orTzIn   = input.string("Europe/Berlin", "Timezone (blank = exchange tz)", group = gO)
+i_orWin    = input.session("0900-0930", "1 · Establish range", group = gO)
+i_orShow   = input.session("0900-1730", "2 · Extend lines until", group = gO)
+i_showMidOr = input.bool(true, "Show midpoint", group = gO)
+i_keepOR   = input.int(60, "Keep last N ranges", minval = 1, maxval = 150, group = gO)
+i_orbLongs = input.bool(true, "OR long breakouts", group = gO)
+i_orbShorts = input.bool(true, "OR short breakouts", group = gO)
+i_onePerSide = input.bool(true, "Max one OR entry per side per day", group = gO)
+i_flatAtEnd = input.bool(false, "Flatten at end of OR window", group = gO)
+
+// ───────────────────────────── 7 · VISUALS ────────────────────────────────────
+gV = "7 · Visuals"
+i_showMAs  = input.bool(true, "Show EMAs", group = gV)
+i_showTrend = input.bool(true, "Show trend EMA", group = gV)
+i_showLevels = input.bool(true, "Show stop / target lines", group = gV)
+i_showTable = input.bool(true, "Show settings table", group = gV)
+
+// ─────────────────────────────── INDICATORS ───────────────────────────────────
+fastEma = ta.ema(close, i_fast)
+slowEma = ta.ema(close, i_slow)
+trendMa = ta.ema(close, i_trendLen)
+rsiVal  = ta.rsi(close, i_rsiLen)
+atrVal  = ta.atr(i_atrLen)
+atrFilt = ta.atr(i_volLen)
+dcHi    = ta.highest(high, i_dcLen)[1]
+dcLo    = ta.lowest(low, i_dcLen)[1]
+
+inWindow = time >= i_start and time <= i_end
+inSess   = not i_useSess or not na(time(timeframe.period, i_sess))
+allowNew = inWindow and inSess
+
+// ───────────────── OPENING RANGE: build, draw, extend, trim ───────────────────
+orTz    = i_orTzIn == "" ? syminfo.timezone : i_orTzIn
+inOR    = not na(time(timeframe.period, i_orWin,  orTz))
+inShow  = not na(time(timeframe.period, i_orShow, orTz))
+orStart = inOR and not inOR[1]
+
+var float orHi = na
+var float orLo = na
+var int   orT1 = na
+var line  lnHi = na
+var line  lnLo = na
+var line  lnMid = na
+var array<line> orHist = array.new<line>()
+var bool orLongDone  = false
+var bool orShortDone = false
+
+colHi  = color.new(color.teal, 0)
+colLo  = color.new(color.red, 0)
+colMid = color.new(color.gray, 0)
+
+// New day -> drop the previous day's handles (objects stay on the chart).
+if orStart
+    orHi := na
+    orLo := na
+    orT1 := na
+    lnHi := na
+    lnLo := na
+    lnMid := na
+    orLongDone  := false
+    orShortDone := false
+
+// Build the range while inside the window.
+if inOR
+    orHi := na(orHi) ? high : math.max(orHi, high)
+    orLo := na(orLo) ? low  : math.min(orLo, low)
+    if na(orT1)
+        orT1 := time
+    if i_showOR
+        if na(lnHi)
+            lnHi  := line.new(orT1, orHi, time, orHi, xloc = xloc.bar_time, color = colHi, width = 2)
+            lnLo  := line.new(orT1, orLo, time, orLo, xloc = xloc.bar_time, color = colLo, width = 2)
+            lnMid := i_showMidOr ? line.new(orT1, math.avg(orHi, orLo), time, math.avg(orHi, orLo), xloc = xloc.bar_time, color = colMid, style = line.style_dashed) : na
+            array.push(orHist, lnHi)
+            array.push(orHist, lnLo)
+            if not na(lnMid)
+                array.push(orHist, lnMid)
+        else
+            line.set_y1(lnHi, orHi)
+            line.set_y2(lnHi, orHi)
+            line.set_y1(lnLo, orLo)
+            line.set_y2(lnLo, orLo)
+            if not na(lnMid)
+                m = math.avg(orHi, orLo)
+                line.set_y1(lnMid, m)
+                line.set_y2(lnMid, m)
+
+// Extend to the right until the cutoff session closes.
+if i_showOR and inShow and not na(lnHi)
+    line.set_x2(lnHi, time)
+    line.set_x2(lnLo, time)
+    if not na(lnMid)
+        line.set_x2(lnMid, time)
+
+// Keep the drawing count well under TradingView's 500-line cap.
+maxOrLines = i_keepOR * (i_showMidOr ? 3 : 2)
+while array.size(orHist) > maxOrLines
+    line.delete(array.shift(orHist))
+
+// ──────────────────────────── SIGNAL ENGINE ───────────────────────────────────
+rsiLongOK  = not i_rsiUse or (rsiVal >= i_rsiLMin and rsiVal <= i_rsiLMax)
+rsiShortOK = not i_rsiUse or (rsiVal >= i_rsiSMin and rsiVal <= i_rsiSMax)
+trendUp    = not i_useTrend or close > trendMa
+trendDn    = not i_useTrend or close < trendMa
+volOK      = not i_useVol or atrFilt / close * 100 >= i_minAtrPct
+
+emaLong  = ta.crossover(fastEma, slowEma)    and rsiLongOK  and trendUp and volOK
+emaShort = ta.crossunder(fastEma, slowEma)   and rsiShortOK and trendDn and volOK
+dcLong   = ta.crossover(close, dcHi)         and rsiLongOK  and trendUp and volOK
+dcShort  = ta.crossunder(close, dcLo)        and rsiShortOK and trendDn and volOK
+rvLong   = ta.crossover(rsiVal, i_rsiOS)     and trendUp and volOK
+rvShort  = ta.crossunder(rsiVal, i_rsiOB)    and trendDn and volOK
+
+// OR breakout: gated by the *cutoff* session, not by any display toggle.
+orbLongRaw  = not inOR and inShow and not na(orHi) and ta.crossover(close, orHi)
+orbShortRaw = not inOR and inShow and not na(orLo) and ta.crossunder(close, orLo)
+orbLong     = i_orbLongs  and orbLongRaw  and (not i_onePerSide or not orLongDone)
+orbShort    = i_orbShorts and orbShortRaw and (not i_onePerSide or not orShortDone)
+
+if orbLong
+    orLongDone := true
+if orbShort
+    orShortDone := true
+
+useEma = i_engine == "EMA + RSI" or i_engine == "EMA + RSI or OR breakout"
+useDc  = i_engine == "Donchian breakout"
+useRv  = i_engine == "RSI reversal"
+useOrb = i_engine == "OR breakout only" or i_engine == "EMA + RSI or OR breakout"
+
+bool longSignal  = (useEma and emaLong)  or (useDc and dcLong)  or (useRv and rvLong)  or (useOrb and orbLong)
+bool shortSignal = (useEma and emaShort) or (useDc and dcShort) or (useRv and rvShort) or (useOrb and orbShort)
+
+canLong  = i_dir != "Short only"
+canShort = i_dir != "Long only"
+
+// ────────────────────────── POSITION SIZING ───────────────────────────────────
+f_qty(float price, float stopDist) =>
+    float q = (strategy.equity * i_equityPct / 100) / price
+    if i_sizeMode == "Fixed contracts"
+        q := i_fixedQty
+    else if i_sizeMode == "Risk % per trade"
+        q := (not na(stopDist) and stopDist > 0) ? (strategy.equity * i_riskPct / 100) / stopDist : i_fixedQty
+    math.max(nz(q, 1), 0.0001)
+
+// ───────────────────── RISK DISTANCES FOR THIS BAR ────────────────────────────
+float slDist = na
+if i_slMode == "ATR"
+    slDist := atrVal * i_slAtrMult
+else if i_slMode == "Percent"
+    slDist := close * i_slPct / 100
+
+float tpDist = na
+if i_tpMode == "R:R"
+    tpDist := na(slDist) ? close * i_tpPct / 100 : slDist * i_rrMult
+else if i_tpMode == "ATR"
+    tpDist := atrVal * i_tpAtrMult
+else if i_tpMode == "Percent"
+    tpDist := close * i_tpPct / 100
+
+// ───────────────────────── POSITION STATE ─────────────────────────────────────
+var float posStop  = na
+var float posTP    = na
+var float posStopD = na
+var float posTrail = na
+
+if strategy.position_size == 0
+    posStop  := na
+    posTP    := na
+    posStopD := na
+    posTrail := na
+
+// ───────────────────────────── ENTRIES ────────────────────────────────────────
+flat = strategy.position_size == 0
+
+if flat and allowNew and canLong and longSignal
+    strategy.entry("Long", strategy.long, qty = f_qty(close, slDist))
+    posStopD := slDist
+    posStop  := na(slDist) ? na : close - slDist
+    posTP    := na(tpDist) ? na : close + tpDist
+    posTrail := i_useTrail ? atrVal * i_trailMult : na
+
+if flat and allowNew and canShort and shortSignal
+    strategy.entry("Short", strategy.short, qty = f_qty(close, slDist))
+    posStopD := slDist
+    posStop  := na(slDist) ? na : close + slDist
+    posTP    := na(tpDist) ? na : close - tpDist
+    posTrail := i_useTrail ? atrVal * i_trailMult : na
+
+// ─────────────────────── STOP / TARGET / TRAIL ORDERS ─────────────────────────
+int trailTicks = na
+if i_useTrail and not na(posTrail)
+    trailTicks := math.max(int(math.round(posTrail / syminfo.mintick)), 1)
+
+if strategy.position_size > 0
+    float pEntry  = strategy.opentrades.entry_price(0)
+    float stopLvl = posStop
+    if i_useBE and not na(posStopD) and not na(pEntry) and high - pEntry >= posStopD * i_beTrigger
+        stopLvl := math.max(nz(stopLvl, pEntry), pEntry * (1 + i_beOffset / 100))
+    strategy.exit("Exit Long", from_entry = "Long", stop = stopLvl, limit = posTP, trail_points = trailTicks, trail_offset = trailTicks)
+
+if strategy.position_size < 0
+    float pEntry  = strategy.opentrades.entry_price(0)
+    float stopLvl = posStop
+    if i_useBE and not na(posStopD) and not na(pEntry) and pEntry - low >= posStopD * i_beTrigger
+        stopLvl := math.min(nz(stopLvl, pEntry), pEntry * (1 - i_beOffset / 100))
+    strategy.exit("Exit Short", from_entry = "Short", stop = stopLvl, limit = posTP, trail_points = trailTicks, trail_offset = trailTicks)
+
+// ─────────────────────── TIME STOP / OPPOSITE / EOD FLAT ──────────────────────
+if strategy.position_size != 0
+    ebIdx = strategy.opentrades.entry_bar_index(0)
+    if i_maxBars > 0 and not na(ebIdx) and bar_index - ebIdx >= i_maxBars
+        strategy.close_all(comment = "Time stop")
+    if i_exitOnOpp and ((strategy.position_size > 0 and emaShort) or (strategy.position_size < 0 and emaLong))
+        strategy.close_all(comment = "Opposite signal")
+    if i_flatAtEnd and inShow[1] and not inShow
+        strategy.close_all(comment = "End of OR window")
+
+// ───────────────────────────── PLOTS ──────────────────────────────────────────
+plot(i_showMAs ? fastEma : na, "Fast EMA", color = color.new(color.orange, 0), linewidth = 1)
+plot(i_showMAs ? slowEma : na, "Slow EMA", color = color.new(color.blue, 0), linewidth = 2)
+plot(i_showTrend ? trendMa : na, "Trend EMA", color = color.new(color.gray, 0), linewidth = 2)
+
+plot(i_showLevels and strategy.position_size > 0 ? posStop : na, "Long stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(i_showLevels and strategy.position_size > 0 ? posTP : na, "Long target", color = color.new(color.teal, 0), style = plot.style_linebr)
+plot(i_showLevels and strategy.position_size < 0 ? posStop : na, "Short stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(i_showLevels and strategy.position_size < 0 ? posTP : na, "Short target", color = color.new(color.teal, 0), style = plot.style_linebr)
+
+bgcolor(allowNew ? na : color.new(color.gray, 92), title = "Outside entry window")
+
+// ─────────────────────────── SETTINGS TABLE ───────────────────────────────────
+var table tb = table.new(position.top_right, 2, 5, bgcolor = color.new(color.black, 25), border_width = 1)
+if barstate.islast and i_showTable
+    table.cell(tb, 0, 0, "Logic",  text_color = color.gray,  text_size = size.small)
+    table.cell(tb, 1, 0, i_engine, text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 1, "Filters", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 1, (i_useTrend ? "EMA " + str.tostring(i_trendLen) : "no trend") + (i_rsiUse ? " · RSI " + str.tostring(i_rsiLMin) + "-" + str.tostring(i_rsiLMax) : ""), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 2, "Stop",   text_color = color.gray,  text_size = size.small)
+    table.cell(tb, 1, 2, i_slMode + (i_slMode == "ATR" ? " x " + str.tostring(i_slAtrMult) : i_slMode == "Percent" ? " " + str.tostring(i_slPct) + "%" : ""), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 3, "Target", text_color = color.gray,  text_size = size.small)
+    table.cell(tb, 1, 3, i_tpMode + (i_tpMode == "R:R" ? " " + str.tostring(i_rrMult) + "R" : i_tpMode == "ATR" ? " x " + str.tostring(i_tpAtrMult) : i_tpMode == "Percent" ? " " + str.tostring(i_tpPct) + "%" : ""), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 4, "OR",     text_color = color.gray,  text_size = size.small)
+    table.cell(tb, 1, 4, i_showOR ? i_orWin + " → " + i_orShow + " (" + orTz + ")" : "off", text_color = color.white, text_size = size.small)
