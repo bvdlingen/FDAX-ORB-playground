@@ -1,0 +1,189 @@
+//@version=6
+strategy("Configurable Strategy Template",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.1,
+     slippage = 2,
+     pyramiding = 0,
+     calc_on_every_tick = false)
+
+// ══════════════════════════════════════════════════
+// 1. INPUTS — TREND
+// ══════════════════════════════════════════════════
+grpTrend = "═══ Trend Filter ═══"
+useTrendFilter   = input.bool(true, "Enable EMA Trend Filter", group = grpTrend)
+fastEmaLen       = input.int(20, "Fast EMA Length", minval = 1, group = grpTrend)
+slowEmaLen       = input.int(50, "Slow EMA Length", minval = 1, group = grpTrend)
+trendMode        = input.string("Crossover", "Entry Signal", options = ["Crossover", "Above/Below"], group = grpTrend)
+
+// ══════════════════════════════════════════════════
+// 2. INPUTS — MOMENTUM
+// ══════════════════════════════════════════════════
+grpMom = "═══ Momentum Filter ═══"
+useRsiFilter     = input.bool(true, "Enable RSI Filter", group = grpMom)
+rsiLen           = input.int(14, "RSI Length", minval = 1, group = grpMom)
+rsiLongMin       = input.int(50, "RSI Min for Long", minval = 0, maxval = 100, group = grpMom)
+rsiLongMax       = input.int(70, "RSI Max for Long", minval = 0, maxval = 100, group = grpMom)
+rsiShortMin      = input.int(30, "RSI Min for Short", minval = 0, maxval = 100, group = grpMom)
+rsiShortMax      = input.int(50, "RSI Max for Short", minval = 0, maxval = 100, group = grpMom)
+
+// ══════════════════════════════════════════════════
+// 3. INPUTS — RISK MANAGEMENT
+// ══════════════════════════════════════════════════
+grpRisk = "═══ Risk Management ═══"
+atrLen           = input.int(14, "ATR Length", minval = 1, group = grpRisk)
+atrStopMult      = input.float(2.0, "Stop Loss (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+atrTakeMult      = input.float(3.0, "Take Profit (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+useTrailingStop  = input.bool(false, "Use Trailing Stop", group = grpRisk)
+trailingActPct   = input.float(1.0, "Trailing Activation (× ATR)", minval = 0.1, step = 0.1, group = grpRisk)
+
+// ══════════════════════════════════════════════════
+// 4. INPUTS — FILTERS
+// ══════════════════════════════════════════════════
+grpFilters = "═══ Filters ═══"
+allowLongs       = input.bool(true, "Allow Longs", group = grpFilters)
+allowShorts      = input.bool(false, "Allow Shorts", group = grpFilters)
+
+// ══════════════════════════════════════════════════
+// 5. OPENING RANGE (Frankfurt 9:00–9:30, lines until 17:30)
+// ══════════════════════════════════════════════════
+grpOR       = "═══ Opening Range ═══"
+showOR      = input.bool(true, "Show Opening Range", group = grpOR)
+orTzInput   = input.string("Europe/Berlin", "Timezone (blank = exchange tz)", group = grpOR)
+orSession   = input.session("0900-0930", "1. Establish Range", group = grpOR)
+showSession = input.session("0930-1730", "2. Keep Lines Until", group = grpOR)
+showMid     = input.bool(true, "Show Midpoint", group = grpOR)
+orTz        = orTzInput == "" ? syminfo.timezone : orTzInput
+
+inOR  = not na(time(timeframe.period, orSession, orTz))
+inWin = not na(time(timeframe.period, showSession, orTz))
+
+var float orHigh     = na
+var float orLow      = na
+var int   orFirstBar = na
+var line  hiLine     = na
+var line  loLine     = na
+var line  midLine    = na
+
+// ── Build the range (highest high / lowest low during 9:00–9:30) ──
+orStart = inOR and not inOR[1]
+if orStart
+    orHigh     := high
+    orLow      := low
+    orFirstBar := bar_index
+else if inOR
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+// ── Draw lines as the range forms ──
+if showOR and inOR
+    if na(hiLine)
+        hiLine := line.new(orFirstBar, orHigh, bar_index, orHigh, color = color.new(color.teal, 0), width = 2)
+        loLine := line.new(orFirstBar, orLow,  bar_index, orLow,  color = color.new(color.red, 0),  width = 2)
+        if showMid
+            midLine := line.new(orFirstBar, math.avg(orHigh, orLow), bar_index, math.avg(orHigh, orLow), color = color.new(color.gray, 0), style = line.style_dashed)
+    line.set_xy1(hiLine, orFirstBar, orHigh)
+    line.set_xy2(hiLine, bar_index, orHigh)
+    line.set_xy1(loLine, orFirstBar, orLow)
+    line.set_xy2(loLine, bar_index, orLow)
+    if showMid and not na(midLine)
+        mid = math.avg(orHigh, orLow)
+        line.set_xy1(midLine, orFirstBar, mid)
+        line.set_xy2(midLine, bar_index, mid)
+
+// ── Extend lines to current bar during the display window ──
+if showOR and inWin and not inOR and not na(hiLine)
+    line.set_x2(hiLine, bar_index)
+    line.set_x2(loLine, bar_index)
+    if showMid and not na(midLine)
+        line.set_x2(midLine, bar_index)
+
+// ── Remove lines when the display window ends (after 17:30) ──
+winEnded = inWin[1] and not inWin
+if winEnded
+    line.delete(hiLine)
+    line.delete(loLine)
+    line.delete(midLine)
+    hiLine  := na
+    loLine  := na
+    midLine := na
+
+// ══════════════════════════════════════════════════
+// CALCULATIONS
+// ══════════════════════════════════════════════════
+fastEma = ta.ema(close, fastEmaLen)
+slowEma = ta.ema(close, slowEmaLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+
+// Trend conditions
+bullCross  = ta.crossover(fastEma, slowEma)
+bearCross  = ta.crossunder(fastEma, slowEma)
+bullTrend  = fastEma > slowEma
+bearTrend  = fastEma < slowEma
+
+trendLongSignal  = trendMode == "Crossover" ? bullCross : bullTrend
+trendShortSignal = trendMode == "Crossover" ? bearCross : bearTrend
+
+// Momentum conditions
+rsiLongOK  = not useRsiFilter or (rsi >= rsiLongMin and rsi <= rsiLongMax)
+rsiShortOK = not useRsiFilter or (rsi >= rsiShortMin and rsi <= rsiShortMax)
+
+// Final entry conditions
+longCondition  = allowLongs  and trendLongSignal  and (not useTrendFilter or bullTrend) and rsiLongOK
+shortCondition = allowShorts and trendShortSignal and (not useTrendFilter or bearTrend) and rsiShortOK
+
+// ══════════════════════════════════════════════════
+// ENTRY ORDERS
+// ══════════════════════════════════════════════════
+if longCondition
+    strategy.entry("Long", strategy.long)
+if shortCondition
+    strategy.entry("Short", strategy.short)
+
+// ══════════════════════════════════════════════════
+// EXIT LOGIC (ATR-based stop / take profit / trailing)
+// ══════════════════════════════════════════════════
+var float longStopPrice  = na
+var float shortStopPrice = na
+var float longTrailAct   = na
+var float shortTrailAct  = na
+
+// Initialize stops on entry
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    longStopPrice := close - atr * atrStopMult
+    longTrailAct  := close + atr * trailingActPct
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    shortStopPrice := close + atr * atrStopMult
+    shortTrailAct  := close - atr * trailingActPct
+
+if useTrailingStop
+    // Update trailing stop once price moves in our favor
+    if strategy.position_size > 0
+        longStopPrice := math.max(longStopPrice, close - atr * atrStopMult)
+    if strategy.position_size < 0
+        shortStopPrice := math.min(shortStopPrice, close + atr * atrStopMult)
+
+// Submit exit orders
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long",
+         stop = longStopPrice,
+         limit = close + atr * atrTakeMult)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short",
+         stop = shortStopPrice,
+         limit = close - atr * atrTakeMult)
+
+// ══════════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════════
+plot(fastEma, "Fast EMA", color = color.orange)
+plot(slowEma, "Slow EMA", color = color.blue)
+plot(strategy.position_size > 0 ? longStopPrice : na, "Long Stop", color = color.red, style = plot.style_linebr)
+plot(strategy.position_size < 0 ? shortStopPrice : na, "Short Stop", color = color.red, style = plot.style_linebr)
+
+plotshape(longCondition,  "Long Entry",  style = shape.triangleup,   location = location.belowbar, color = color.green, size = size.small)
+plotshape(shortCondition, "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.red,   size = size.small)
